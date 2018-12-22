@@ -4,8 +4,6 @@
 
 (enable-console-print!)
 
-(println "This text is printed from src/astar/core.cljs. Go ahead and edit it and see reloading in action.")
-
 (def grid-size 50)
 (def starting-begin-square-idx 51)
 (def starting-end-square-idx (+ 48 (* 50 48)))
@@ -13,7 +11,6 @@
 (defn calc-idx [x y]
   (+ x (* grid-size y)))
 
-;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (r/atom
                      {:begin-square-idx starting-begin-square-idx
                       :end-square-idx starting-end-square-idx
@@ -24,8 +21,11 @@
                                                     starting-begin-square-idx :begin
                                                     starting-end-square-idx :end
                                                     :nowall)})))}))
+(defonce mouse-down (atom false))
+(defonce running? (atom false))
+(defonce step-delay (r/atom 50))
 
-(def mouse-down (atom false))
+(defonce solution (r/atom "Waiting to run..."))
 
 (defn within-bounds? [n]
   (<= 0 n (dec (* grid-size grid-size))))
@@ -57,11 +57,11 @@
         node-x (mod node grid-size)
         node-y (quot node grid-size)]
     (js/Math.sqrt
-      (+ (js/Math.pow (js/Math.abs (- node-y end-y)) 2)
-         (js/Math.pow (js/Math.abs (- node-x end-x)) 2)))))
+      (+ (js/Math.pow (- node-y end-y) 2)
+         (js/Math.pow (- node-x end-x) 2)))))
 
 (defn reconstruct-path [node came-from]
-  (loop [path [node]
+  (loop [path (list node)
          curr (came-from node)
          came-from (dissoc came-from node)]
     (if (came-from curr)
@@ -72,56 +72,61 @@
                (dissoc came-from curr)))
       (conj path curr))))
 
-(def counter (atom 0))
-(defn run-astar []
-  (reset! counter 0)
-  (loop [state {:visited #{}
-                :unvisited #{(:begin-square-idx @app-state)}
-                :came-from {}
-                :gscore {(:begin-square-idx @app-state) 0}
-                :fscore {(:begin-square-idx @app-state) (heuristic-cost-estimate (:begin-square-idx @app-state))}}]
-    (swap! counter inc)
-    ;(doseq [x (range 1000000)] (inc x))
-    (if (> @counter 10000)
-      (println "Ran out of loops")
-      (do
-        ;(println (count (:unvisited state)))
-        ;(println (count (:visited state)))
-        (if (empty? (:unvisited state))
-          (println "NO SOLUTION :(")
-          (let [current (first (apply min-key second (select-keys (:fscore state) (:unvisited state))))]
-            ;(println (get-neighbors current))
-            (if (= current (:end-square-idx @app-state))
-              (do (println "FOUND END! " current)
-                  (println (reconstruct-path current (:came-from state))))
-              (recur
-                (reduce
-                  (fn [{:keys [visited unvisited gscore] :as new-state} neighbor]
-                    (if (visited neighbor)
-                      new-state
-                      (let [tentative-gscore (+ (get gscore current 99999999) 1 ;distnace to neighbor is always 1...right?
-                                                )]
-                        (if (and (unvisited neighbor)
-                                 (>= tentative-gscore (get gscore neighbor 99999999)))
-                          new-state
-                          (-> (cond-> new-state (not (unvisited neighbor)) (update :unvisited conj neighbor))
-                              (update :came-from assoc neighbor current)
-                              (update :gscore assoc neighbor tentative-gscore)
-                              (update :fscore assoc neighbor (+ tentative-gscore (heuristic-cost-estimate neighbor))))))))
-                  (-> state
-                      (update :visited conj current)
-                      (update :unvisited disj current))
-                  (get-neighbors current))))))))))
-
 (defn reset-grid []
+  (reset! running? false)
+  (reset! solution "Waiting to run...")
   (doseq [g (:grid @app-state)]
     (when-not (#{:begin :end :nowall} (:type @g))
       (swap! g assoc :type :nowall))))
 
 (defn clear-path []
+  (reset! running? false)
+  (reset! solution "Waiting to run...")
   (doseq [g (:grid @app-state)]
-    (when (= (:type @g) :current)
+    (when (#{:current :potential} (:type @g))
       (swap! g assoc :type :nowall))))
+
+(defn run-astar []
+  (clear-path)
+  (reset! running? true)
+  (reset! solution "Running...")
+  (async/go-loop
+    [state {:visited #{}
+            :unvisited #{(:begin-square-idx @app-state)}
+            :came-from {}
+            :fscore {(:begin-square-idx @app-state) (heuristic-cost-estimate (:begin-square-idx @app-state))}}]
+
+    (async/<! (async/timeout @step-delay))
+
+    (let [closest-node (first (apply min-key second (select-keys (:fscore state) (:unvisited state))))]
+      (cond
+        (not @running?)
+        (reset! solution "Waiting to run...")
+
+        (empty? (:unvisited state))
+        (reset! solution "No solution found.")
+
+        (= closest-node (:end-square-idx @app-state))
+        (do (println (reconstruct-path closest-node (:came-from state)))
+            (reset! solution "Solution found!"))
+
+        :else
+        (recur
+          (reduce
+            (fn [{:keys [visited unvisited] :as new-state} neighbor]
+              (when (= :nowall (:type @(get-in @app-state [:grid neighbor])))
+                (swap! (get-in @app-state [:grid neighbor]) assoc :type :potential))
+              (if (visited neighbor)
+                new-state
+                (if (unvisited neighbor)
+                  new-state
+                  (-> (cond-> new-state (not (unvisited neighbor)) (update :unvisited conj neighbor))
+                      (update :came-from assoc neighbor closest-node)
+                      (update :fscore assoc neighbor (heuristic-cost-estimate neighbor))))))
+            (-> state
+                (update :visited conj closest-node)
+                (update :unvisited disj closest-node))
+            (get-neighbors closest-node)))))))
 
 (defn update-square-type [square]
   (let [{:keys [selection-type begin-square-idx end-square-idx]} @app-state]
@@ -149,14 +154,14 @@
                                     :begin :yellow
                                     :end :orange
                                     :wall :red
-                                    :current :pink
+                                    :current :lightgreen
+                                    :potential :green
                                     :nowall :blue)}
          :on-click (fn [] (update-square-type square-data))
          :on-mouse-down (fn [] (reset! mouse-down true))
          :on-mouse-over (fn []
                           (when @mouse-down
-                            (update-square-type square-data)))
-         }])
+                            (update-square-type square-data)))}])
 
 (defn make-grid []
   (into [:div]
@@ -168,16 +173,21 @@
 
 (defn controls []
   [:div {:style {:margin-bottom :10px}}
-   [:select {:type :checkbox
-             :on-change (fn [e] (swap! app-state assoc :selection-type (-> e .-target .-value keyword)))}
+   [:select {:size 4 :style {:height :100%} :value (:selection-type @app-state)
+             :on-change (fn [e] (swap! app-state assoc :selection-type (keyword (.. e -target -value))))}
     [:option {:value :wall} "Draw Wall"]
     [:option {:value :nowall} "Erase Wall"]
     [:option {:value :begin} "Begining Square"]
     [:option {:value :end} "Ending Square"]]
    [:button {:style {:margin-left :10px} :on-click (fn [] (reset-grid))} "Reset Grid"]
    [:div {:style {:margin-top :10px}}
-    [:button {:on-click (fn [] (async/go (run-astar)))} "Run A*"]
-    [:button {:on-click (fn [] (clear-path)) :style {:margin-left :10px}} "Clear"]]])
+    [:button {:on-click run-astar} "Run A*"]
+    [:button {:on-click clear-path :style {:margin-left :10px}} "Clear"]
+    [:div {:style {:margin-top :10px}}
+     [:input {:type :range :min 0 :max 100 :value @step-delay
+              :step 5 :on-change #(reset! step-delay (.. % -target -value))}]
+     " " @step-delay "ms"]]
+   [:div @solution]])
 
 (defn a* []
   (.addEventListener js/document "mouseup" (fn [] (reset! mouse-down false)))
